@@ -1,0 +1,63 @@
+---
+- name: Actualizar herramientas Hyper-V y kernel
+  hosts: all
+  become: true
+  tasks:
+
+    - name: Ver kernel actual (antes)
+      command: uname -r
+      register: kernel_antes
+      changed_when: false
+
+    - name: Mostrar kernel actual
+      debug:
+        msg: "Kernel anterior: {{ kernel_antes.stdout }}"
+
+    - name: Actualizar cache de apt
+      apt:
+        update_cache: yes
+
+    - name: Instalar metapaquetes de herramientas Hyper-V
+      apt:
+        name:
+          - linux-tools-virtual
+          - linux-cloud-tools-virtual
+        state: present
+
+    - name: Listar kernels instalados
+      shell: dpkg -l | grep linux-image
+      register: kernels_instalados
+      changed_when: false
+
+    - name: Mostrar kernels instalados
+      debug:
+        var: kernels_instalados.stdout_lines
+
+    - name: Reiniciar la VM y esperar reconexión
+      reboot:
+        reboot_timeout: 300
+        connect_timeout: 20
+        test_command: uptime
+
+    - name: Ver kernel actual (después del reinicio)
+      command: uname -r
+      register: kernel_despues
+      changed_when: false
+
+    - name: Mostrar kernel nuevo
+      debug:
+        msg: "Kernel nuevo: {{ kernel_despues.stdout }}"
+
+    - name: Verificar estado del servicio KVP
+      systemd:
+        name: hv-kvp-daemon.service
+      register: kvp_status
+
+    - name: Mostrar estado de KVP
+      debug:
+        msg: "KVP status: {{ kvp_status.status.ActiveState }}"
+
+    - name: Fallar si KVP no está activo
+      fail:
+        msg: "El servicio hv-kvp-daemon no está activo, revisar manualmente"
+      when: kvp_status.status.ActiveState != "active"
