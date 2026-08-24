@@ -1,0 +1,15 @@
+---
+- name: Instalar paquete en VMs seleccionadas
+  hosts: all
+  become: true
+  vars:
+    paquete: htop
+  tasks:
+    - name: Actualizar cache de apt
+      apt:
+        update_cache: yes
+
+    - name: Instalar paquete
+      apt:
+        name: "{{ paquete }}"
+        state: present
