@@ -5,15 +5,9 @@
   gather_facts: true
 
   tasks:
-
-    - name: Mostrar kernel actualmente cargado
-      ansible.builtin.debug:
-        msg: "Kernel actual: {{ ansible_kernel }}"
-
     - name: Actualizar cache de APT
       ansible.builtin.apt:
         update_cache: true
-        cache_valid_time: 3600
 
     - name: Instalar herramientas de Hyper-V
       ansible.builtin.apt:
@@ -22,33 +16,22 @@
           - linux-cloud-tools-virtual
         state: present
 
-    - name: Comprobar si Ubuntu requiere reinicio
-      ansible.builtin.stat:
-        path: /var/run/reboot-required
-      register: reboot_required
+    - name: Reiniciar la VM
+      ansible.builtin.reboot:
+        reboot_timeout: 600
 
-    - name: Intentar iniciar hv-kvp-daemon
+    - name: Verificar servicio KVP despues del reinicio
       ansible.builtin.systemd:
         name: hv-kvp-daemon.service
         state: started
         enabled: true
-      register: kvp_result
-      failed_when: false
 
     - name: Consultar estado de KVP
       ansible.builtin.command:
         cmd: systemctl is-active hv-kvp-daemon.service
       register: kvp_status
       changed_when: false
-      failed_when: false
 
-    - name: Resultado por servidor
+    - name: Mostrar resultado
       ansible.builtin.debug:
-        msg: |
-          ========================================
-          Servidor: {{ inventory_hostname }}
-          IP: {{ ansible_host | default(inventory_hostname) }}
-          Kernel: {{ ansible_kernel }}
-          KVP: {{ kvp_status.stdout }}
-          Requiere reboot: {{ reboot_required.stat.exists }}
-          ========================================
+        msg: "Servidor {{ inventory_hostname }} - KVP: {{ kvp_status.stdout }}"
