@@ -83,6 +83,12 @@
       register: aide_cron
       changed_when: false
 
+    - name: Verificar residuos AIDE
+      shell: |
+        du -sh /var/lib/aide /var/log/aide /etc/aide 2>/dev/null || true
+      register: aide_residual
+      changed_when: false
+
     - name: Obtener espacio en disco despues
       command: df -h
       register: disk_after
@@ -95,4 +101,5 @@
           - "Binario AIDE: {{ aide_binary.stdout | default('') }}"
           - "Timers AIDE: {{ aide_timers.stdout | default('') }}"
           - "Cron AIDE: {{ aide_cron.stdout | default('') }}"
+          - "Residuos AIDE: {{ aide_residual.stdout | default('') }}"
           - "{{ disk_after.stdout }}"
