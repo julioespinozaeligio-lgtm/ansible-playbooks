@@ -1,6 +1,6 @@
 ---
 - name: Actualizar herramientas Hyper-V y kernel
-  hosts: all
+  hosts: todas_las_vms
   become: true
   tasks:
 
