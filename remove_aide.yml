@@ -1,0 +1,102 @@
+---
+- name: Eliminar AIDE de servidores Linux
+  hosts: all
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Obtener uso de disco antes de eliminar AIDE
+      shell: |
+        if [ -d /var/lib/aide ]; then
+          du -sh /var/lib/aide
+        else
+          echo "0B /var/lib/aide"
+        fi
+      register: aide_size_before
+      changed_when: false
+
+    - name: Mostrar uso de AIDE antes de eliminar
+      debug:
+        msg: "{{ aide_size_before.stdout }}"
+
+    - name: Detener y deshabilitar timer de AIDE
+      systemd:
+        name: dailyaidecheck.timer
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Detener servicio de AIDE
+      systemd:
+        name: dailyaidecheck.service
+        state: stopped
+      failed_when: false
+
+    - name: Eliminar entradas AIDE del crontab de root
+      shell: |
+        TMPFILE=$(mktemp)
+        crontab -l 2>/dev/null | grep -vi aide > "$TMPFILE" || true
+        crontab "$TMPFILE"
+        rm -f "$TMPFILE"
+      changed_when: true
+
+    - name: Desinstalar AIDE y aide-common
+      apt:
+        name:
+          - aide
+          - aide-common
+        state: absent
+        purge: true
+        update_cache: false
+
+    - name: Eliminar directorio de base de datos AIDE
+      file:
+        path: /var/lib/aide
+        state: absent
+
+    - name: Eliminar logs de AIDE
+      file:
+        path: /var/log/aide
+        state: absent
+
+    - name: Eliminar configuracion residual de AIDE
+      file:
+        path: /etc/aide
+        state: absent
+
+    - name: Limpiar dependencias no utilizadas
+      apt:
+        autoremove: true
+
+    - name: Recargar systemd
+      systemd:
+        daemon_reload: true
+
+    - name: Verificar binario AIDE
+      shell: command -v aide || true
+      register: aide_binary
+      changed_when: false
+
+    - name: Verificar timers AIDE
+      shell: systemctl list-timers --all | grep -i aide || true
+      register: aide_timers
+      changed_when: false
+
+    - name: Verificar cron AIDE
+      shell: grep -Ri aide /etc/cron* /var/spool/cron/crontabs 2>/dev/null || true
+      register: aide_cron
+      changed_when: false
+
+    - name: Obtener espacio en disco despues
+      command: df -h
+      register: disk_after
+      changed_when: false
+
+    - name: Resultado final
+      debug:
+        msg:
+          - "AIDE antes: {{ aide_size_before.stdout }}"
+          - "Binario AIDE: {{ aide_binary.stdout | default('') }}"
+          - "Timers AIDE: {{ aide_timers.stdout | default('') }}"
+          - "Cron AIDE: {{ aide_cron.stdout | default('') }}"
+          - "{{ disk_after.stdout }}"
