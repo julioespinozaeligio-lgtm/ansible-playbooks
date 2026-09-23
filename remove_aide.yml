@@ -1,6 +1,6 @@
 ---
 - name: Eliminar AIDE de servidores Linux
-  hosts: all
+  hosts: todas_las_vms
   become: true
   gather_facts: true
 
