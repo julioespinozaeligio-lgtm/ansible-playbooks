@@ -64,10 +64,6 @@
         path: /etc/aide
         state: absent
 
-    - name: Limpiar dependencias no utilizadas
-      apt:
-        autoremove: true
-
     - name: Recargar systemd
       systemd:
         daemon_reload: true
