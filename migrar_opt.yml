@@ -21,7 +21,7 @@
   serial: 1
   vars:
     opt_phase: migrate
-    opt_grow_root: false
+    opt_grow_root: true
 
   tasks:
     - name: Comprobar la fase solicitada
