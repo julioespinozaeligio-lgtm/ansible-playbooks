@@ -9,7 +9,7 @@
 # opt_services (lista de unidades .service) es opcional: si no se define
 # para un host, se detectan automaticamente los servicios que usan /opt.
 - name: Auditar, migrar o eliminar la particion /opt
-  hosts: todas_las_vm
+  hosts: todas_las_vms
   become: true
   gather_facts: false
   serial: 1
