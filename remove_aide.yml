@@ -5,6 +5,7 @@
   gather_facts: true
 
   tasks:
+
     - name: Obtener uso de disco antes de eliminar AIDE
       shell: |
         if [ -d /var/lib/aide ]; then
@@ -32,13 +33,14 @@
         state: stopped
       failed_when: false
 
-    - name: Eliminar entradas AIDE del crontab de root
+    - name: Eliminar entradas AIDE del crontab de root si existen
       shell: |
-        TMPFILE=$(mktemp)
-        crontab -l 2>/dev/null | grep -vi aide > "$TMPFILE" || true
-        crontab "$TMPFILE"
-        rm -f "$TMPFILE"
-      changed_when: true
+        if crontab -l 2>/dev/null | grep -qi aide; then
+          crontab -l 2>/dev/null | grep -vi aide | crontab -
+          echo "AIDE_REMOVED"
+        fi
+      register: aide_cron_remove
+      changed_when: "'AIDE_REMOVED' in aide_cron_remove.stdout"
 
     - name: Desinstalar AIDE y aide-common
       apt:
@@ -69,7 +71,7 @@
         path: /etc/logrotate.d/aide
         state: absent
 
-    - name: Recargar systemd
+    - name: Recargar configuracion de systemd
       systemd:
         daemon_reload: true
 
@@ -84,8 +86,15 @@
       changed_when: false
 
     - name: Verificar cron AIDE
-      shell: grep -Ri aide /etc/cron* /var/spool/cron/crontabs 2>/dev/null || true
+      shell: |
+        crontab -l 2>/dev/null | grep -i aide || true
+        grep -Ri aide /etc/cron* /var/spool/cron/crontabs 2>/dev/null || true
       register: aide_cron
+      changed_when: false
+
+    - name: Verificar referencias AIDE en logrotate
+      shell: grep -Ri aide /etc/logrotate.d 2>/dev/null || true
+      register: aide_logrotate
       changed_when: false
 
     - name: Verificar residuos AIDE
@@ -95,9 +104,61 @@
       register: aide_residual
       changed_when: false
 
-    - name: Verificar referencias AIDE en logrotate
-      shell: grep -Ri aide /etc/logrotate.d 2>/dev/null || true
-      register: aide_logrotate
+    - name: Validar que AIDE fue eliminado completamente
+      shell: |
+        ERR=0
+
+        if command -v aide >/dev/null 2>&1; then
+          echo "ERROR: binario AIDE sigue instalado"
+          ERR=1
+        fi
+
+        if systemctl list-timers --all 2>/dev/null | grep -qi aide; then
+          echo "ERROR: existe timer AIDE"
+          ERR=1
+        fi
+
+        if crontab -l 2>/dev/null | grep -qi aide; then
+          echo "ERROR: existe AIDE en crontab de root"
+          ERR=1
+        fi
+
+        if grep -Ri aide /etc/cron* /var/spool/cron/crontabs >/dev/null 2>&1; then
+          echo "ERROR: existe referencia AIDE en cron"
+          ERR=1
+        fi
+
+        if [ -e /var/lib/aide ]; then
+          echo "ERROR: existe /var/lib/aide"
+          ERR=1
+        fi
+
+        if [ -e /var/log/aide ]; then
+          echo "ERROR: existe /var/log/aide"
+          ERR=1
+        fi
+
+        if [ -e /etc/aide ]; then
+          echo "ERROR: existe /etc/aide"
+          ERR=1
+        fi
+
+        if [ -e /etc/logrotate.d/aide ]; then
+          echo "ERROR: existe /etc/logrotate.d/aide"
+          ERR=1
+        fi
+
+        if grep -Ri aide /etc/logrotate.d >/dev/null 2>&1; then
+          echo "ERROR: existe referencia AIDE dentro de logrotate"
+          ERR=1
+        fi
+
+        if [ "$ERR" -eq 0 ]; then
+          echo "OK - AIDE eliminado completamente"
+        fi
+
+        exit "$ERR"
+      register: aide_validation
       changed_when: false
 
     - name: Obtener espacio en disco despues
@@ -108,10 +169,17 @@
     - name: Resultado final
       debug:
         msg:
+          - "========================================="
+          - "RESULTADO DE LIMPIEZA AIDE"
+          - "========================================="
           - "AIDE antes: {{ aide_size_before.stdout }}"
           - "Binario AIDE: {{ aide_binary.stdout | default('') }}"
           - "Timers AIDE: {{ aide_timers.stdout | default('') }}"
           - "Cron AIDE: {{ aide_cron.stdout | default('') }}"
           - "Logrotate AIDE: {{ aide_logrotate.stdout | default('') }}"
           - "Residuos AIDE: {{ aide_residual.stdout | default('') }}"
+          - "Validacion final: {{ aide_validation.stdout | default('') }}"
+          - "========================================="
+          - "ESPACIO EN DISCO"
+          - "========================================="
           - "{{ disk_after.stdout }}"
