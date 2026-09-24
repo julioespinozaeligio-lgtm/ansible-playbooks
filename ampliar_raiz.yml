@@ -11,7 +11,7 @@
 # Requiere en los destinos: parted, growpart (cloud-guest-utils) y resize2fs.
 # Se puede ejecutar varias veces: si ya esta ampliado, no cambia nada.
 - name: Eliminar sda3 y ampliar la raiz
-  hosts: vms_con_opt
+  hosts: todas_las_vms
   become: true
   gather_facts: false
   serial: 1
