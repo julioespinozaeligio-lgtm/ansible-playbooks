@@ -1,0 +1,309 @@
+---
+# Uso:
+#   ansible-playbook -i inventario migrar_opt.yml
+#   ansible-playbook -i inventario migrar_opt.yml -e opt_phase=migrate --limit un_host
+#   ansible-playbook -i inventario migrar_opt.yml -e opt_phase=delete --limit un_host
+# La fase delete borra sda3 y amplia sda2/ext4 hasta ocupar todo el disco.
+# Requiere ansible.posix, rsync, psmisc (fuser), parted, growpart,
+# resize2fs y systemd en los destinos.
+# Definir opt_services por host (lista de unidades .service) en host_vars/inventario.
+- name: Auditar, migrar o eliminar la particion /opt
+  hosts: vms_con_opt
+  become: true
+  gather_facts: false
+  serial: 1
+  vars:
+    opt_phase: audit
+
+  tasks:
+    - name: Comprobar la fase solicitada
+      ansible.builtin.assert:
+        that:
+          - opt_phase in ['audit', 'migrate', 'delete']
+
+    - name: Mostrar distribucion y procesos que usan /opt
+      ansible.builtin.shell: |
+        printf '%s\n' '--- particiones ---'
+        lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINTS /dev/sda
+        printf '%s\n' '--- montajes ---'
+        findmnt -R /opt || true
+        printf '%s\n' '--- capacidad ---'
+        df -h / /opt
+        printf '%s\n' '--- procesos y unidades ---'
+        for pid in $(fuser -m /opt 2>/dev/null); do
+          printf 'PID %s: ' "$pid"
+          ps -p "$pid" -o user=,comm=
+          cat "/proc/$pid/cgroup" 2>/dev/null || true
+        done
+      register: opt_audit
+      changed_when: false
+      when: opt_phase == 'audit'
+
+    - name: Presentar auditoria
+      ansible.builtin.debug:
+        var: opt_audit.stdout_lines
+      when: opt_phase == 'audit'
+
+    - name: Migrar /opt a la raiz
+      when: opt_phase == 'migrate'
+      block:
+        - name: Exigir lista revisada de servicios para este host
+          ansible.builtin.assert:
+            that:
+              - opt_services is defined
+              - opt_services is sequence
+              - opt_services is not string
+            fail_msg: "Definir opt_services para este host, incluso [] si no usa /opt ningun servicio."
+
+        - name: Comprobar origen de /
+          ansible.builtin.command: findmnt -n -o SOURCE -T /
+          register: opt_root_source
+          changed_when: false
+
+        - name: Comprobar origen de /opt
+          ansible.builtin.command: findmnt -n -o SOURCE -T /opt
+          register: opt_old_source
+          changed_when: false
+
+        - name: Comprobar sistema de archivos de ambas particiones
+          ansible.builtin.command: lsblk -n -o FSTYPE /dev/sda2 /dev/sda3
+          register: opt_fstypes
+          changed_when: false
+
+        - name: Comprobar que /opt no tenga montajes secundarios
+          ansible.builtin.command: findmnt -R -n -o TARGET /opt
+          register: opt_mount_tree
+          changed_when: false
+
+        - name: Detenerse si el disco difiere de la imagen esperada
+          ansible.builtin.assert:
+            that:
+              - opt_root_source.stdout == '/dev/sda2'
+              - opt_old_source.stdout == '/dev/sda3'
+              - opt_fstypes.stdout_lines | map('trim') | list == ['ext4', 'ext4']
+              - opt_mount_tree.stdout_lines == ['/opt']
+
+        - name: Medir espacio disponible en la raiz
+          ansible.builtin.shell: df -B1 --output=avail / | tail -n 1
+          register: opt_root_free
+          changed_when: false
+
+        - name: Medir tamano aparente de /opt
+          ansible.builtin.command: du -sb /opt
+          register: opt_data_size
+          changed_when: false
+
+        - name: Exigir espacio suficiente mas 1 GiB de margen
+          ansible.builtin.assert:
+            that:
+              - opt_root_free.stdout | int > (opt_data_size.stdout.split()[0] | int) + 1073741824
+
+        - name: Comprobar herramientas requeridas
+          ansible.builtin.shell: command -v rsync && command -v fuser
+          changed_when: false
+
+        - name: Obtener estado inicial de servicios
+          ansible.builtin.service_facts:
+
+        - name: Comprobar que existen los servicios declarados
+          ansible.builtin.assert:
+            that:
+              - opt_services | difference(ansible_facts['services'].keys() | list) | length == 0
+
+        - name: Recordar solo los servicios que estaban activos
+          ansible.builtin.set_fact:
+            opt_running_services: >-
+              {{ opt_services | intersect(
+                   ansible_facts['services'] | dict2items |
+                   selectattr('value.state', 'equalto', 'running') |
+                   map(attribute='key') | list) | list }}
+
+        - name: Crear directorio temporal en la raiz
+          ansible.builtin.file:
+            path: /opt-en-raiz
+            state: directory
+            mode: '0755'
+
+        - name: Primera copia mientras los servicios siguen activos
+          ansible.builtin.command:
+            argv: [rsync, -aHAX, --numeric-ids, /opt/, /opt-en-raiz/]
+
+        - name: Detener, sincronizar y verificar antes de cambiar el montaje
+          block:
+            - name: Detener servicios declarados que estaban activos
+              ansible.builtin.systemd_service:
+                name: "{{ item }}"
+                state: stopped
+              loop: "{{ opt_running_services }}"
+
+            - name: Fallar si algun proceso aun usa /opt
+              ansible.builtin.shell: |
+                if pids=$(fuser -m /opt 2>/dev/null); then
+                  echo "Procesos todavia en /opt: $pids"
+                  exit 1
+                fi
+              changed_when: false
+
+            - name: Sincronizacion final
+              ansible.builtin.command:
+                argv: [rsync, -aHAX, --numeric-ids, --delete, /opt/, /opt-en-raiz/]
+
+            - name: Verificar que no haya diferencias
+              ansible.builtin.command:
+                argv: [rsync, -aHAXnci, --numeric-ids, --delete, /opt/, /opt-en-raiz/]
+              register: opt_diff
+              changed_when: false
+              failed_when: opt_diff.rc != 0 or opt_diff.stdout | length > 0
+          rescue:
+            - name: Reanudar servicios si se aborto antes de desmontar /opt
+              ansible.builtin.systemd_service:
+                name: "{{ item }}"
+                state: started
+              loop: "{{ opt_running_services }}"
+
+            - name: Detener esta migracion para revisar el problema
+              ansible.builtin.fail:
+                msg: "La particion original sigue montada; revisar procesos o diferencias."
+
+        - name: Respaldar fstab antes de modificarlo
+          ansible.builtin.copy:
+            src: /etc/fstab
+            dest: /etc/fstab.bak-antes-opt-ansible
+            remote_src: true
+            force: false
+            mode: preserve
+
+        - name: Quitar entrada de /opt de fstab sin desmontarlo aun
+          ansible.posix.mount:
+            path: /opt
+            state: absent_from_fstab
+
+        - name: Recargar systemd tras editar fstab
+          ansible.builtin.systemd_service:
+            daemon_reload: true
+
+        - name: Desmontar la antigua particion /opt
+          ansible.builtin.command: umount /opt
+
+        - name: Exigir que el directorio oculto por el montaje este vacio
+          ansible.builtin.command: rmdir /opt
+
+        - name: Poner la copia en su ruta definitiva
+          ansible.builtin.command: mv -T /opt-en-raiz /opt
+
+        - name: Comprobar que /opt ahora reside en sda2
+          ansible.builtin.command: findmnt -n -o SOURCE -T /opt
+          register: opt_new_source
+          changed_when: false
+          failed_when: opt_new_source.rc != 0 or opt_new_source.stdout != '/dev/sda2'
+
+        - name: Arrancar los servicios que estaban activos
+          ansible.builtin.systemd_service:
+            name: "{{ item }}"
+            state: started
+          loop: "{{ opt_running_services }}"
+
+        - name: Reiniciar para comprobar persistencia del montaje
+          ansible.builtin.reboot:
+            reboot_timeout: 900
+
+        - name: Comprobar que /opt sigue en la raiz despues del reinicio
+          ansible.builtin.command: findmnt -n -o SOURCE -T /opt
+          register: opt_after_reboot
+          changed_when: false
+          failed_when: opt_after_reboot.rc != 0 or opt_after_reboot.stdout != '/dev/sda2'
+
+        - name: Obtener estado de los servicios tras el reinicio
+          ansible.builtin.service_facts:
+
+        - name: Verificar servicios que estaban activos
+          ansible.builtin.assert:
+            that:
+              - ansible_facts['services'][item]['state'] == 'running'
+          loop: "{{ opt_running_services }}"
+
+        - name: Recordatorio de validacion funcional
+          ansible.builtin.debug:
+            msg: >-
+              /opt ya reside en sda2. Validar la aplicacion y el antivirus
+              antes de ejecutar la fase delete en este host.
+
+    - name: Eliminar sda3 y ampliar la raiz tras validar la aplicacion
+      when: opt_phase == 'delete'
+      block:
+        - name: Verificar que /opt ya resida en sda2
+          ansible.builtin.command: findmnt -n -o SOURCE -T /opt
+          register: opt_delete_source
+          changed_when: false
+          failed_when: opt_delete_source.rc != 0 or opt_delete_source.stdout != '/dev/sda2'
+
+        - name: Verificar que la raiz sea ext4
+          ansible.builtin.command: lsblk -n -o FSTYPE /dev/sda2
+          register: opt_root_fstype
+          changed_when: false
+          failed_when: opt_root_fstype.rc != 0 or opt_root_fstype.stdout | trim != 'ext4'
+
+        - name: Verificar que las herramientas de ampliacion esten instaladas
+          ansible.builtin.shell: command -v parted && command -v growpart && command -v resize2fs
+          changed_when: false
+
+        - name: Consultar si aun existe sda3
+          ansible.builtin.stat:
+            path: /dev/sda3
+          register: opt_old_partition
+
+        - name: Verificar que sda3 no este montada si existe
+          ansible.builtin.shell: |
+            set -e
+            test "$(lsblk -n -o FSTYPE /dev/sda3 | xargs)" = ext4
+            test -z "$(lsblk -n -o MOUNTPOINTS /dev/sda3 | xargs)"
+          changed_when: false
+          when: opt_old_partition.stat.exists
+
+        - name: Verificar que no haya entrada activa de /opt en fstab
+          ansible.builtin.shell: |
+            awk '$2 == "/opt" && $1 !~ /^#/ { print; exit 1 }' /etc/fstab
+          changed_when: false
+
+        - name: Eliminar la antigua sda3
+          ansible.builtin.command:
+            argv: [parted, -s, /dev/sda, rm, '3']
+          when: opt_old_partition.stat.exists
+
+        - name: Ampliar la particion raiz al final del disco
+          ansible.builtin.command:
+            argv: [growpart, /dev/sda, '2']
+          register: opt_growpart
+          changed_when: "'CHANGED:' in opt_growpart.stdout"
+          failed_when: >-
+            opt_growpart.rc != 0 and
+            'NOCHANGE:' not in (opt_growpart.stdout ~ opt_growpart.stderr)
+
+        - name: Ampliar el sistema de archivos ext4 montado
+          ansible.builtin.command:
+            argv: [resize2fs, /dev/sda2]
+
+        - name: Comprobar que la particion ocupa el disco disponible
+          ansible.builtin.shell: |
+            disco=$(blockdev --getsize64 /dev/sda)
+            raiz=$(blockdev --getsize64 /dev/sda2)
+            test "$((disco - raiz))" -lt 16777216
+          changed_when: false
+
+        - name: Mostrar espacio final de la raiz
+          ansible.builtin.command: df -h /
+          register: opt_final_root
+          changed_when: false
+
+        - name: Presentar espacio final de la raiz
+          ansible.builtin.debug:
+            var: opt_final_root.stdout_lines
+
+        - name: Mostrar estado final del disco
+          ansible.builtin.command: lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINTS /dev/sda
+          register: opt_final_disk
+          changed_when: false
+
+        - name: Presentar estado final
+          ansible.builtin.debug:
+            var: opt_final_disk.stdout_lines
