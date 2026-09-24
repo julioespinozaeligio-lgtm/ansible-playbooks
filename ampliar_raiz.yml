@@ -1,4 +1,3 @@
-
 ---
 # ampliar_raiz.yml
 # Elimina la antigua sda3 (si aun existe) y amplia sda2 + ext4 al 100% del
@@ -16,57 +15,57 @@
   become: true
   gather_facts: false
   serial: 1
- 
+
   tasks:
     - name: Consultar si existe /opt/postgresql
       ansible.builtin.stat:
         path: /opt/postgresql
       register: grow_postgres_dir
- 
+
     - name: Avisar que se omite este host por PostgreSQL
       ansible.builtin.debug:
         msg: "Se omite {{ inventory_hostname }}: tiene /opt/postgresql."
       when: grow_postgres_dir.stat.exists
- 
+
     - name: Omitir hosts con /opt/postgresql
       ansible.builtin.meta: end_host
       when: grow_postgres_dir.stat.exists
- 
+
     - name: Consultar donde reside /opt
       ansible.builtin.command: findmnt -n -o SOURCE -T /opt
       register: grow_opt_source
       changed_when: false
- 
+
     - name: Avisar si el host aun no esta migrado
       ansible.builtin.debug:
         msg: "Se omite {{ inventory_hostname }}: /opt reside en {{ grow_opt_source.stdout }}, no en /dev/sda2."
       when: grow_opt_source.stdout != '/dev/sda2'
- 
+
     - name: Omitir host no migrado
       ansible.builtin.meta: end_host
       when: grow_opt_source.stdout != '/dev/sda2'
- 
+
     - name: Verificar que la raiz sea sda2 con ext4
       ansible.builtin.shell: |
         set -e
         test "$(findmnt -n -o SOURCE /)" = /dev/sda2
         test "$(lsblk -n -o FSTYPE /dev/sda2 | xargs)" = ext4
       changed_when: false
- 
+
     - name: Verificar que no haya entrada activa de /opt en fstab
       ansible.builtin.shell: |
         awk '$2 == "/opt" && $1 !~ /^#/ { print; exit 1 }' /etc/fstab
       changed_when: false
- 
+
     - name: Verificar herramientas requeridas
       ansible.builtin.shell: command -v parted && command -v growpart && command -v resize2fs
       changed_when: false
- 
+
     - name: Consultar si aun existe sda3
       ansible.builtin.stat:
         path: /dev/sda3
       register: grow_sda3
- 
+
     - name: Verificar que sda3 sea ext4 y no este montada
       ansible.builtin.shell: |
         set -e
@@ -74,12 +73,29 @@
         test -z "$(lsblk -n -o MOUNTPOINTS /dev/sda3 | xargs)"
       changed_when: false
       when: grow_sda3.stat.exists
- 
+
     - name: Eliminar la antigua sda3
       ansible.builtin.command:
         argv: [parted, -s, /dev/sda, rm, '3']
       when: grow_sda3.stat.exists
- 
+
+    - name: Esperar a que el sistema registre el cambio de particiones
+      ansible.builtin.command: udevadm settle
+      changed_when: false
+      when: grow_sda3.stat.exists
+
+    - name: Confirmar que sda3 ya no existe antes de ampliar
+      ansible.builtin.shell: |
+        if parted -s /dev/sda print | awk '$1 == "3"' | grep -q .; then
+          echo "sda3 sigue en la tabla de particiones"
+          exit 1
+        fi
+        if test -e /dev/sda3; then
+          echo "el kernel aun ve /dev/sda3"
+          exit 1
+        fi
+      changed_when: false
+
     - name: Ampliar la particion sda2 al final del disco
       ansible.builtin.command:
         argv: [growpart, /dev/sda, '2']
@@ -88,13 +104,13 @@
       failed_when: >-
         grow_growpart.rc != 0 and
         'NOCHANGE:' not in (grow_growpart.stdout ~ grow_growpart.stderr)
- 
+
     - name: Ampliar el sistema de archivos ext4 montado
       ansible.builtin.command:
         argv: [resize2fs, /dev/sda2]
       register: grow_resize
       changed_when: "'Nothing to do' not in (grow_resize.stdout ~ grow_resize.stderr)"
- 
+
     - name: Comprobar que sda2 llega al final del disco
       ansible.builtin.shell: |
         inicio=$(cat /sys/block/sda/sda2/start)
@@ -103,7 +119,7 @@
         # sectores de 512 bytes; 2048 = 1 MiB de holgura (GPT de respaldo)
         test "$((disco - inicio - tam))" -lt 2048
       changed_when: false
- 
+
     - name: Comprobar que ext4 ocupa toda la particion
       ansible.builtin.shell: |
         part=$(blockdev --getsize64 /dev/sda2)
@@ -111,7 +127,7 @@
         tam_bloque=$(dumpe2fs -h /dev/sda2 2>/dev/null | awk -F: '/^Block size/ {gsub(/ /,"",$2); print $2}')
         test "$((part - bloques * tam_bloque))" -lt 1048576
       changed_when: false
- 
+
     - name: Mostrar estado final
       ansible.builtin.shell: |
         parted -s /dev/sda unit GiB print free
@@ -119,8 +135,7 @@
         df -h /
       register: grow_final
       changed_when: false
- 
+
     - name: Presentar estado final
       ansible.builtin.debug:
         var: grow_final.stdout_lines
- 
