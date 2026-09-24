@@ -64,6 +64,11 @@
         path: /etc/aide
         state: absent
 
+    - name: Eliminar configuracion de AIDE en logrotate
+      file:
+        path: /etc/logrotate.d/aide
+        state: absent
+
     - name: Recargar systemd
       systemd:
         daemon_reload: true
@@ -86,7 +91,13 @@
     - name: Verificar residuos AIDE
       shell: |
         du -sh /var/lib/aide /var/log/aide /etc/aide 2>/dev/null || true
+        ls -l /etc/logrotate.d/aide 2>/dev/null || true
       register: aide_residual
+      changed_when: false
+
+    - name: Verificar referencias AIDE en logrotate
+      shell: grep -Ri aide /etc/logrotate.d 2>/dev/null || true
+      register: aide_logrotate
       changed_when: false
 
     - name: Obtener espacio en disco despues
@@ -101,5 +112,6 @@
           - "Binario AIDE: {{ aide_binary.stdout | default('') }}"
           - "Timers AIDE: {{ aide_timers.stdout | default('') }}"
           - "Cron AIDE: {{ aide_cron.stdout | default('') }}"
+          - "Logrotate AIDE: {{ aide_logrotate.stdout | default('') }}"
           - "Residuos AIDE: {{ aide_residual.stdout | default('') }}"
           - "{{ disk_after.stdout }}"
