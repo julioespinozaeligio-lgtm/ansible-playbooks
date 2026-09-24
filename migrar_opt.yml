@@ -15,7 +15,7 @@
 # Requiere ansible.posix, rsync, psmisc (fuser), parted y systemd en los destinos
 # (growpart y resize2fs solo si opt_grow_root=true).
 - name: Auditar, migrar o eliminar la particion /opt
-  hosts: vms_con_opt
+  hosts: todas_las_vms
   become: true
   gather_facts: false
   serial: 1
