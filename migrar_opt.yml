@@ -13,7 +13,7 @@
   gather_facts: false
   serial: 1
   vars:
-    opt_phase: audit
+    opt_phase: migrate
 
   tasks:
     - name: Comprobar la fase solicitada
