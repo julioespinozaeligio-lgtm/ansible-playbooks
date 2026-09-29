@@ -1,539 +1,299 @@
+
 ---
+# ============================================================
+# Instalacion de PostgreSQL en /opt
+# Uso:
+#   ansible-playbook -i inventario instalar_postgresql.yml \
+#     -e pg_version=16 -e pg_postgres_password='...'
+# ============================================================
 - name: Instalar y configurar PostgreSQL
   hosts: postgres_servers
   become: true
   gather_facts: true
-  serial: 1
-
+ 
   vars:
-
-    # ============================================================
-    # PARAMETROS PRINCIPALES
-    # ============================================================
-
-    # Sobrescribir desde Semaphore segun la version requerida.
-    pg_version: "16"
-
-    # Particion que se ampliara para utilizar el espacio disponible.
-    disk_device: "/dev/sda"
-    partition_number: "3"
-    partition_device: "/dev/sda3"
-
-    # Permite desactivar el crecimiento de disco si no se requiere.
+    # ---------- Parametros (se mandan desde Semaphore) ----------
+    pg_version: "16"                  # 15, 16, 17, 18, 19, 20...
+    # pg_postgres_password: ""        # obligatorio: secret de Semaphore o Vault
+ 
     expand_disk: true
-
-    # Maximo de conexiones PostgreSQL.
-    pg_max_connections: "1000"
-
-    # PostgreSQL escuchara en todas las interfaces.
+    disk_device: /dev/sda
+    partition_number: 3
+    partition_device: /dev/sda3
+ 
     pg_listen_addresses: "0.0.0.0"
-
-    # Red permitida en pg_hba.conf.
+    pg_max_connections: 1000
     pg_allowed_cidr: "0.0.0.0/0"
-
-    # ============================================================
-    # MAPEO VERSION -> PUERTO
-    # ============================================================
-
-    pg_ports:
-      "15": 5455
-      "16": 5456
-      "17": 5457
-      "18": 5458
-      "19": 5459
-      "20": 5460
-
-    # ============================================================
-    # VARIABLES CALCULADAS
-    # ============================================================
-
-    pg_port: "{{ pg_ports[(pg_version | string)] }}"
-
+ 
+    # ---------- Calculadas (no modificar) ----------
+    pg_port: "{{ 5440 + (pg_version | int) }}"
     pg_service: "postgresql@{{ pg_version }}-main"
-
     pg_old_data_dir: "/var/lib/postgresql/{{ pg_version }}/main"
-
     pg_new_data_parent: "/opt/postgresql/{{ pg_version }}"
-
     pg_new_data_dir: "/opt/postgresql/{{ pg_version }}/main"
-
-    pg_config_dir: "/etc/postgresql/{{ pg_version }}/main"
-
     pg_conf: "/etc/postgresql/{{ pg_version }}/main/postgresql.conf"
-
     pg_hba: "/etc/postgresql/{{ pg_version }}/main/pg_hba.conf"
-
-    pg_repo_key: "/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc"
-
-    pg_repo_file: "/etc/apt/sources.list.d/pgdg.list"
-
+    pg_repo_key: /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+    pg_repo_file: /etc/apt/sources.list.d/pgdg.list
+ 
+    # Necesario para become_user: postgres
+    ansible_pipelining: true
+ 
   pre_tasks:
-
-    # ============================================================
-    # VALIDACIONES INICIALES
-    # ============================================================
-
-    - name: Validar sistema operativo Debian/Ubuntu
+    - name: Validar version PostgreSQL
       ansible.builtin.assert:
-        that:
-          - ansible_os_family == "Debian"
-        fail_msg: "Este playbook esta preparado para Debian/Ubuntu."
-
-    - name: Validar version PostgreSQL soportada
-      ansible.builtin.assert:
-        that:
-          - (pg_version | string) in pg_ports
-        fail_msg: >
-          La version PostgreSQL {{ pg_version }} no esta definida.
-          Versiones permitidas: 15, 16, 17, 18, 19 y 20.
-
-    - name: Validar que se haya proporcionado password de postgres
+        that: (pg_version | int) >= 15
+        fail_msg: "pg_version={{ pg_version }} no es valida."
+ 
+    - name: Validar password de postgres
       ansible.builtin.assert:
         that:
           - pg_postgres_password is defined
           - pg_postgres_password | length > 0
-        fail_msg: >
-          Debes proporcionar la variable pg_postgres_password
-          desde Semaphore o Ansible Vault.
+        fail_msg: "Falta pg_postgres_password."
       no_log: true
-
+ 
+    - name: Parametros de esta ejecucion
+      ansible.builtin.debug:
+        msg: "PostgreSQL {{ pg_version }} | puerto {{ pg_port }} | datos en {{ pg_new_data_dir }}"
+ 
   tasks:
-
     # ============================================================
-    # PASO 1
-    # EXTENDER DISCO / PARTICION / FILESYSTEM
+    # PASO 1 - AUMENTAR ESPACIO DISPONIBLE
+    #   parted /dev/sda -> resizepart 3 100%
+    #   resize2fs /dev/sda3
     # ============================================================
-
-    - name: Instalar herramientas necesarias
+    - name: Paso 1 - Extender disco
+      when: expand_disk | bool
+      block:
+        - name: Instalar growpart
+          ansible.builtin.apt:
+            name: cloud-guest-utils
+            state: present
+ 
+        - name: Extender particion {{ partition_device }}
+          ansible.builtin.command:
+            cmd: "growpart {{ disk_device }} {{ partition_number }}"
+          register: growpart_result
+          changed_when: "'CHANGED' in growpart_result.stdout"
+          failed_when:
+            - growpart_result.rc != 0
+            - "'NOCHANGE' not in (growpart_result.stdout ~ growpart_result.stderr)"
+ 
+        - name: resize2fs {{ partition_device }}
+          ansible.builtin.command:
+            cmd: "resize2fs {{ partition_device }}"
+          register: resize2fs_result
+          changed_when: "'Nothing to do' not in (resize2fs_result.stdout ~ resize2fs_result.stderr)"
+ 
+    # ============================================================
+    # PASO 2 - REPOSITORIO PGDG
+    # ============================================================
+    - name: Paso 2 - Instalar curl y ca-certificates
       ansible.builtin.apt:
-        name:
-          - curl
-          - ca-certificates
-          - lsb-release
-          - cloud-guest-utils
-          - parted
-          - e2fsprogs
-          - ufw
+        name: [curl, ca-certificates]
         state: present
-        update_cache: true
-
-    - name: Verificar particion que sera ampliada
-      ansible.builtin.stat:
-        path: "{{ partition_device }}"
-      register: pg_partition
-      when: expand_disk | bool
-
-    - name: Validar que exista la particion
-      ansible.builtin.assert:
-        that:
-          - pg_partition.stat.exists
-        fail_msg: >
-          No existe {{ partition_device }}.
-          Revisa disk_device, partition_number y partition_device.
-      when: expand_disk | bool
-
-    - name: Detectar filesystem de la particion
-      ansible.builtin.command:
-        cmd: "blkid -s TYPE -o value {{ partition_device }}"
-      register: partition_filesystem
-      changed_when: false
-      when: expand_disk | bool
-
-    - name: Validar filesystem compatible con resize2fs
-      ansible.builtin.assert:
-        that:
-          - partition_filesystem.stdout | trim in ['ext2', 'ext3', 'ext4']
-        fail_msg: >
-          {{ partition_device }} utiliza
-          {{ partition_filesystem.stdout | trim }}.
-          Este playbook solo ejecuta resize2fs sobre ext2/ext3/ext4.
-      when: expand_disk | bool
-
-    - name: Expandir particion hasta utilizar espacio disponible
-      ansible.builtin.command:
-        cmd: "growpart {{ disk_device }} {{ partition_number }}"
-      register: growpart_result
-      changed_when: >
-        'CHANGED:' in
-        (growpart_result.stdout ~ growpart_result.stderr)
-      failed_when: >
-        growpart_result.rc not in [0, 1] or
-        (
-          growpart_result.rc == 1 and
-          'NOCHANGE' not in
-          (growpart_result.stdout ~ growpart_result.stderr)
-        )
-      when: expand_disk | bool
-
-    - name: Informar al kernel del cambio de particion
-      ansible.builtin.command:
-        cmd: "partprobe {{ disk_device }}"
-      changed_when: false
-      when:
-        - expand_disk | bool
-        - growpart_result is changed
-
-    - name: Esperar actualizacion de dispositivos
-      ansible.builtin.command:
-        cmd: udevadm settle
-      changed_when: false
-      when:
-        - expand_disk | bool
-        - growpart_result is changed
-
-    - name: Expandir filesystem
-      ansible.builtin.command:
-        cmd: "resize2fs {{ partition_device }}"
-      register: resizefs_result
-      changed_when: >
-        'Nothing to do' not in
-        (resizefs_result.stdout ~ resizefs_result.stderr)
-      when: expand_disk | bool
-
-
-    # ============================================================
-    # PASO 2
-    # CONFIGURAR REPOSITORIO OFICIAL PGDG
-    # ============================================================
-
-    - name: Crear directorio para llave PGDG
+ 
+    - name: Paso 2 - Crear directorio de la llave
       ansible.builtin.file:
         path: /usr/share/postgresql-common/pgdg
         state: directory
-        owner: root
-        group: root
         mode: "0755"
-
-    - name: Descargar llave oficial PGDG
+ 
+    - name: Paso 2 - Descargar llave PGDG
       ansible.builtin.get_url:
         url: https://www.postgresql.org/media/keys/ACCC4CF8.asc
         dest: "{{ pg_repo_key }}"
-        owner: root
-        group: root
         mode: "0644"
-
-    - name: Configurar repositorio PostgreSQL PGDG
+ 
+    - name: Paso 2 - Agregar repositorio PGDG
       ansible.builtin.copy:
         dest: "{{ pg_repo_file }}"
-        owner: root
-        group: root
-        mode: "0644"
         content: |
           deb [signed-by={{ pg_repo_key }}] https://apt.postgresql.org/pub/repos/apt {{ ansible_distribution_release }}-pgdg main
+        mode: "0644"
       register: pgdg_repo
-
-    - name: Actualizar cache APT
+ 
+    - name: Paso 2 - apt update
       ansible.builtin.apt:
         update_cache: true
-
-
+      when: pgdg_repo is changed
+ 
     # ============================================================
-    # INSTALAR VERSION SOLICITADA DE POSTGRESQL
+    # PASO 3 - INSTALAR POSTGRESQL
     # ============================================================
-
-    - name: Instalar PostgreSQL {{ pg_version }}
+    - name: Paso 3 - Verificar que la version exista en PGDG
+      ansible.builtin.command:
+        cmd: "apt-cache show postgresql-{{ pg_version }}"
+      register: pg_available
+      changed_when: false
+      failed_when: pg_available.rc != 0
+ 
+    - name: Paso 3 - Instalar PostgreSQL {{ pg_version }}
       ansible.builtin.apt:
         name:
           - "postgresql-{{ pg_version }}"
           - "postgresql-doc-{{ pg_version }}"
-          - "postgresql-server-dev-{{ pg_version }}"
           - libpq-dev
+          - "postgresql-server-dev-{{ pg_version }}"
         state: present
-
-
+        cache_valid_time: 3600
+ 
     # ============================================================
-    # VALIDAR INSTALACION INICIAL
+    # PASO 4 - VALIDAR SERVICIO INICIAL
     # ============================================================
-
-    - name: Asegurar que cluster PostgreSQL inicial este levantado
-      ansible.builtin.systemd:
-        name: "{{ pg_service }}"
-        state: started
-
-    - name: Validar estado inicial de PostgreSQL
+    - name: Paso 4 - Validar {{ pg_service }} activo
       ansible.builtin.command:
         cmd: "systemctl is-active {{ pg_service }}"
       register: pg_initial_status
       changed_when: false
-      failed_when: pg_initial_status.stdout | trim != "active"
-
-
+      retries: 5
+      delay: 3
+      until: pg_initial_status.stdout == "active"
+ 
     # ============================================================
-    # PASO 3
-    # MOVER DATA DIRECTORY A /opt
+    # PASO 5 - MOVER DATA DIRECTORY A /opt Y CONFIGURAR
     # ============================================================
-
-    - name: Verificar data directory original
-      ansible.builtin.stat:
-        path: "{{ pg_old_data_dir }}"
-      register: pg_old_dir
-
-    - name: Verificar PG_VERSION original
+    - name: Paso 5 - Revisar datos en ruta original
       ansible.builtin.stat:
         path: "{{ pg_old_data_dir }}/PG_VERSION"
       register: pg_old_marker
-
-    - name: Verificar data directory en /opt
-      ansible.builtin.stat:
-        path: "{{ pg_new_data_dir }}"
-      register: pg_new_dir
-
-    - name: Verificar PG_VERSION en /opt
+ 
+    - name: Paso 5 - Revisar datos en /opt
       ansible.builtin.stat:
         path: "{{ pg_new_data_dir }}/PG_VERSION"
       register: pg_new_marker
-
-    - name: Detener si existen dos data directories validos
+ 
+    - name: Paso 5 - Detener si hay datos en ambas rutas
       ansible.builtin.fail:
-        msg: >
-          Se encontraron datos PostgreSQL tanto en
-          {{ pg_old_data_dir }} como en {{ pg_new_data_dir }}.
-          No se realizara ningun movimiento automaticamente.
-      when:
-        - pg_old_marker.stat.exists
-        - pg_new_marker.stat.exists
-
-    - name: Detener si destino existe pero no parece un cluster PostgreSQL
-      ansible.builtin.fail:
-        msg: >
-          Existe {{ pg_new_data_dir }} pero no contiene PG_VERSION.
-          Revisar manualmente antes de continuar.
-      when:
-        - pg_new_dir.stat.exists
-        - not pg_new_marker.stat.exists
-        - pg_old_marker.stat.exists
-
-    - name: Crear directorio padre PostgreSQL en /opt
-      ansible.builtin.file:
-        path: "{{ pg_new_data_parent }}"
-        state: directory
-        owner: postgres
-        group: postgres
-        mode: "0755"
-
-    - name: Detener PostgreSQL antes de mover data directory
-      ansible.builtin.systemd:
-        name: "{{ pg_service }}"
-        state: stopped
-      when:
-        - pg_old_marker.stat.exists
-        - not pg_new_marker.stat.exists
-
-    - name: Mover data directory PostgreSQL a /opt
-      ansible.builtin.command:
-        cmd: "mv {{ pg_old_data_dir }} {{ pg_new_data_parent }}/"
-      when:
-        - pg_old_marker.stat.exists
-        - not pg_new_marker.stat.exists
-      notify:
-        - Reiniciar PostgreSQL
-
-    - name: Verificar nuevo data directory despues del movimiento
-      ansible.builtin.stat:
-        path: "{{ pg_new_data_dir }}/PG_VERSION"
-      register: pg_data_moved
-
-    - name: Validar que data directory exista en /opt
-      ansible.builtin.assert:
-        that:
-          - pg_data_moved.stat.exists
-        fail_msg: >
-          No se encontro {{ pg_new_data_dir }}/PG_VERSION.
-          No se continuara con la configuracion.
-
-
-    # ============================================================
-    # PERMISOS DEL DATA DIRECTORY
-    # ============================================================
-
-    - name: Verificar permisos del data directory
-      ansible.builtin.stat:
-        path: "{{ pg_new_data_dir }}"
-      register: pg_data_permissions
-
-    - name: Corregir propietario de data directory
-      ansible.builtin.file:
-        path: "{{ pg_new_data_dir }}"
-        owner: postgres
-        group: postgres
-        recurse: true
-      when: >
-        pg_data_permissions.stat.pw_name != 'postgres' or
-        pg_data_permissions.stat.gr_name != 'postgres'
-
-
-    # ============================================================
-    # CONFIGURAR postgresql.conf
-    # ============================================================
-
-    - name: Configurar data_directory
+        msg: "Hay datos en {{ pg_old_data_dir }} y en {{ pg_new_data_dir }}. Revisar manualmente."
+      when: pg_old_marker.stat.exists and pg_new_marker.stat.exists
+ 
+    - name: Paso 5 - Mover data directory (solo la primera vez)
+      when: pg_old_marker.stat.exists and not pg_new_marker.stat.exists
+      block:
+        - name: Detener {{ pg_service }}
+          ansible.builtin.systemd:
+            name: "{{ pg_service }}"
+            state: stopped
+ 
+        - name: mkdir -p {{ pg_new_data_parent }}
+          ansible.builtin.file:
+            path: "{{ pg_new_data_parent }}"
+            state: directory
+            mode: "0755"
+ 
+        - name: mv {{ pg_old_data_dir }} {{ pg_new_data_parent }}
+          ansible.builtin.command:
+            cmd: "mv {{ pg_old_data_dir }} {{ pg_new_data_parent }}/"
+          notify: Reiniciar PostgreSQL
+ 
+    - name: Paso 5 - postgresql.conf
       ansible.builtin.lineinfile:
         path: "{{ pg_conf }}"
-        regexp: '^\s*#?\s*data_directory\s*=.*$'
-        line: "data_directory = '{{ pg_new_data_dir }}'"
+        regexp: '^\s*#?\s*{{ item.key }}\s*='
+        line: "{{ item.key }} = {{ item.value }}"
         backup: true
-      notify:
-        - Reiniciar PostgreSQL
-
-    - name: Configurar listen_addresses
-      ansible.builtin.lineinfile:
-        path: "{{ pg_conf }}"
-        regexp: '^\s*#?\s*listen_addresses\s*=.*$'
-        line: "listen_addresses = '{{ pg_listen_addresses }}'"
-      notify:
-        - Reiniciar PostgreSQL
-
-    - name: Configurar puerto PostgreSQL
-      ansible.builtin.lineinfile:
-        path: "{{ pg_conf }}"
-        regexp: '^\s*#?\s*port\s*=.*$'
-        line: "port = {{ pg_port }}"
-      notify:
-        - Reiniciar PostgreSQL
-
-    - name: Configurar max_connections
-      ansible.builtin.lineinfile:
-        path: "{{ pg_conf }}"
-        regexp: '^\s*#?\s*max_connections\s*=.*$'
-        line: "max_connections = {{ pg_max_connections }}"
-      notify:
-        - Reiniciar PostgreSQL
-
-
-    # ============================================================
-    # CONFIGURAR pg_hba.conf
-    # ============================================================
-
-    - name: Permitir conexiones IPv4 mediante SCRAM
+      loop:
+        - { key: data_directory,   value: "'{{ pg_new_data_dir }}'" }
+        - { key: listen_addresses, value: "'{{ pg_listen_addresses }}'" }
+        - { key: port,             value: "{{ pg_port }}" }
+        - { key: max_connections,  value: "{{ pg_max_connections }}" }
+      loop_control:
+        label: "{{ item.key }} = {{ item.value }}"
+      notify: Reiniciar PostgreSQL
+ 
+    - name: Paso 5 - pg_hba.conf
       ansible.builtin.lineinfile:
         path: "{{ pg_hba }}"
         insertafter: '^# IPv4 local connections:'
-        line: "host    all             all             {{ pg_allowed_cidr }}             scram-sha-256"
-        state: present
+        line: "host    all             all             {{ pg_allowed_cidr }}               scram-sha-256"
         backup: true
-      notify:
-        - Reiniciar PostgreSQL
-
-
+      notify: Reiniciar PostgreSQL
+ 
+    - name: Paso 5 - chown -R postgres:postgres {{ pg_new_data_dir }}
+      ansible.builtin.file:
+        path: "{{ pg_new_data_dir }}"
+        state: directory
+        owner: postgres
+        group: postgres
+        recurse: true
+ 
     # ============================================================
-    # FIREWALL
+    # PASO 6 - LEVANTAR, VALIDAR Y HABILITAR
     # ============================================================
-
-    - name: Abrir puerto PostgreSQL {{ pg_port }} en UFW
-      ansible.builtin.command:
-        cmd: "ufw allow {{ pg_port }}/tcp"
-      register: ufw_postgresql
-      changed_when: >
-        'Skipping adding existing rule' not in
-        (ufw_postgresql.stdout ~ ufw_postgresql.stderr)
-
-
-    # ============================================================
-    # APLICAR CAMBIOS
-    # ============================================================
-
-    - name: Aplicar reinicio pendiente de PostgreSQL
+    - name: Paso 6 - Aplicar reinicio pendiente
       ansible.builtin.meta: flush_handlers
-
-    - name: Habilitar PostgreSQL al arranque y asegurar servicio activo
+ 
+    - name: Paso 6 - start + enable {{ pg_service }}
       ansible.builtin.systemd:
         name: "{{ pg_service }}"
+        state: started
         enabled: true
-        state: started
-
-
-    # ============================================================
-    # VALIDAR SERVICIO Y PUERTO
-    # ============================================================
-
-    - name: Validar estado final de PostgreSQL
+ 
+    - name: Paso 6 - Consultar data_directory efectivo
       ansible.builtin.command:
-        cmd: "systemctl is-active {{ pg_service }}"
-      register: pg_final_status
-      changed_when: false
-      failed_when: pg_final_status.stdout | trim != "active"
-
-    - name: Esperar que PostgreSQL escuche en puerto {{ pg_port }}
-      ansible.builtin.wait_for:
-        host: "127.0.0.1"
-        port: "{{ pg_port }}"
-        state: started
-        timeout: 30
-
-
-    # ============================================================
-    # CONFIGURAR PASSWORD DEL USUARIO postgres
-    # ============================================================
-
-    - name: Configurar password del usuario postgres
-      become: true
+        argv: [psql, -p, "{{ pg_port }}", -d, postgres, -Atc, "SHOW data_directory"]
       become_user: postgres
-      ansible.builtin.shell: |
-        psql \
-          -p {{ pg_port }} \
-          -d postgres \
-          -v ON_ERROR_STOP=1 <<'SQL'
-        ALTER ROLE postgres WITH PASSWORD '{{ pg_postgres_password | replace("'", "''") }}';
-        SQL
-      args:
-        executable: /bin/bash
+      register: pg_effective_data
+      changed_when: false
+      retries: 5
+      delay: 3
+      until: pg_effective_data.rc == 0
+ 
+    - name: Paso 6 - Validar que corre desde /opt
+      ansible.builtin.assert:
+        that: pg_effective_data.stdout | trim == pg_new_data_dir
+        fail_msg: "Corre desde {{ pg_effective_data.stdout }}, se esperaba {{ pg_new_data_dir }}."
+ 
+    # ============================================================
+    # PASO 7 - FIREWALL
+    # ============================================================
+    - name: Paso 7 - ufw allow {{ pg_port }}/tcp
+      ansible.builtin.command:
+        cmd: "ufw allow {{ pg_port }}/tcp"
+      register: ufw_result
+      changed_when: "'Skipping adding existing rule' not in ufw_result.stdout"
+ 
+    # ============================================================
+    # PASO 8 - PASSWORD DEL USUARIO postgres
+    # ============================================================
+    - name: Paso 8 - Probar password actual
+      ansible.builtin.command:
+        argv: [psql, -h, 127.0.0.1, -p, "{{ pg_port }}", -U, postgres, -d, postgres, -Atc, "SELECT 1"]
+      environment:
+        PGPASSWORD: "{{ pg_postgres_password }}"
+      register: pg_pass_check
+      changed_when: false
+      failed_when: false
       no_log: true
-      changed_when: true
-
-
-    # ============================================================
-    # VALIDACIONES FINALES
-    # ============================================================
-
-    - name: Consultar clusters PostgreSQL
+ 
+    - name: Paso 8 - Configurar password de postgres
       ansible.builtin.command:
-        cmd: pg_lsclusters
-      register: pg_clusters
-      changed_when: false
-
-    - name: Consultar configuracion efectiva PostgreSQL
-      become: true
+        argv: [psql, -p, "{{ pg_port }}", -d, postgres, -v, ON_ERROR_STOP=1]
+        stdin: "ALTER ROLE postgres WITH PASSWORD '{{ pg_postgres_password | replace(\"'\", \"''\") }}';"
       become_user: postgres
+      when: pg_pass_check.rc != 0
+      no_log: true
+ 
+    - name: Paso 8 - Validar login (SELECT version())
       ansible.builtin.command:
-        argv:
-          - psql
-          - -p
-          - "{{ pg_port | string }}"
-          - -d
-          - postgres
-          - -At
-          - -c
-          - >
-            SELECT
-            current_setting('data_directory') || ' | ' ||
-            current_setting('port') || ' | ' ||
-            current_setting('max_connections') || ' | ' ||
-            current_setting('listen_addresses');
-      register: pg_effective_config
+        argv: [psql, -h, 127.0.0.1, -p, "{{ pg_port }}", -U, postgres, -d, postgres, -Atc, "SELECT version()"]
+      environment:
+        PGPASSWORD: "{{ pg_postgres_password }}"
+      register: pg_version_check
       changed_when: false
-
-    - name: Mostrar resultado final
+ 
+    - name: Resultado final
       ansible.builtin.debug:
         msg:
-          - "============================================"
-          - "PostgreSQL instalado correctamente"
-          - "Version: {{ pg_version }}"
-          - "Servicio: {{ pg_service }}"
-          - "Puerto: {{ pg_port }}"
+          - "PostgreSQL {{ pg_version }} listo en puerto {{ pg_port }}"
           - "Data directory: {{ pg_new_data_dir }}"
-          - "Max connections: {{ pg_max_connections }}"
-          - "Listen addresses: {{ pg_listen_addresses }}"
-          - "Estado: {{ pg_final_status.stdout }}"
-          - "============================================"
-          - "Clusters:"
-          - "{{ pg_clusters.stdout_lines }}"
-          - "Configuracion efectiva:"
-          - "{{ pg_effective_config.stdout }}"
-
-
+          - "{{ pg_version_check.stdout }}"
+ 
   handlers:
-
     - name: Reiniciar PostgreSQL
       ansible.builtin.systemd:
         name: "{{ pg_service }}"
         state: restarted
+ 
