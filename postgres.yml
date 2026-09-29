@@ -7,7 +7,7 @@
 #     -e pg_version=16 -e pg_postgres_password='...'
 # ============================================================
 - name: Instalar y configurar PostgreSQL
-  hosts: postgres_servers
+  hosts: todas_las_vms
   become: true
   gather_facts: true
  
