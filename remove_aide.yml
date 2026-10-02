@@ -3,8 +3,7 @@
   hosts: todas_las_vms
   become: true
   gather_facts: true
-  serial: 1
-  max_fail_percentage: 100
+
   vars:
     unidades_auditoria:
       - dailyaidecheck.timer
